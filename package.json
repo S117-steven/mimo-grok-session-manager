@@ -1,0 +1,22 @@
+{
+  "name": "mimo-session-manager",
+  "version": "1.0.0",
+  "description": "Local-only session manager for MiMo Code",
+  "main": "server.js",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check server.js && node --check app.js",
+    "start": "node server.js"
+  },
+  "keywords": ["mimo", "session", "manager"],
+  "author": "S117-steven",
+  "license": "MIT",
+  "type": "commonjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/S117-steven/MiMo-Session-Manager.git"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.10.0"
+  }
+}

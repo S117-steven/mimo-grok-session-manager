@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MiMo Code Session Manager</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; min-height: 100vh; padding: 32px 18px; background: #f2f5f7; color: #17202a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
+        button, input, select { font: inherit; }
+        .container { max-width: 1380px; margin: 0 auto; }
+        .header, .toolbar, .table-header, .modal-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+        .header { align-items: flex-start; margin-bottom: 24px; }
+        .header-actions, .actions { display: flex; flex-wrap: wrap; gap: 7px; justify-content: flex-end; }
+        h1 { margin: 0 0 7px; font-size: 27px; }
+        p { margin: 0; color: #667; font-size: 14px; }
+        .button { border: 0; border-radius: 7px; padding: 8px 13px; cursor: pointer; transition: background .15s, opacity .15s; }
+        .button:disabled { cursor: wait; opacity: .55; }
+        .button-primary { background: #00a846; color: #fff; }
+        .button-primary:hover { background: #008d3b; }
+        .button-secondary { background: #e9edef; color: #344; }
+        .button-secondary:hover { background: #dce2e5; }
+        .button-warning { background: #fff0d9; color: #965d00; }
+        .button-danger { background: #fde8e8; color: #b52d2d; }
+        .button-small { padding: 6px 9px; font-size: 12px; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 16px; }
+        .card, .session-table, .modal { background: #fff; border-radius: 11px; box-shadow: 0 2px 10px rgba(20, 40, 60, .06); }
+        .card { padding: 17px 21px; }
+        .card-label { color: #7a858d; font-size: 12px; }
+        .card-value { margin-top: 5px; font-size: 27px; font-weight: 650; }
+        .toolbar { justify-content: flex-start; flex-wrap: wrap; padding: 15px 20px; margin-bottom: 14px; background: #fff; border-radius: 11px; box-shadow: 0 2px 10px rgba(20, 40, 60, .06); }
+        .toolbar label { color: #5b666d; font-size: 13px; }
+        .toolbar select { min-width: 190px; margin-left: 6px; padding: 7px 9px; border: 1px solid #d8dfe3; border-radius: 6px; background: #fff; }
+        .checkbox { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+        .session-table { overflow: hidden; }
+        .table-header { padding: 17px 20px; border-bottom: 1px solid #edf0f2; }
+        .table-header h2 { margin: 0; font-size: 16px; }
+        .count, .muted, .updated { color: #7a858d; font-size: 12px; }
+        .session-row { display: grid; grid-template-columns: 24px 42px minmax(180px, 1fr) minmax(180px, 260px) 145px minmax(300px, auto); align-items: center; gap: 10px; padding: 13px 20px; border-bottom: 1px solid #f0f2f3; }
+        .session-row:last-child { border-bottom: 0; }
+        .session-row:hover { background: #fafcfc; }
+        .session-row.pinned { background: #fffbef; }
+        .session-row.hidden-session { opacity: .62; }
+        .title, .directory { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .title { font-weight: 550; }
+        .directory { color: #637078; font-size: 12px; }
+        .pin-mark { color: #b77900; font-weight: bold; }
+        .bulk-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 20px; border-bottom: 1px solid #edf0f2; background: #fafcfc; }
+        .selection-count { color: #58656d; font-size: 13px; margin-right: auto; }
+        .message { padding: 55px 20px; text-align: center; color: #748087; }
+        .modal-overlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 20px; background: rgba(0, 0, 0, .45); z-index: 10; }
+        .modal-overlay.active { display: flex; }
+        .modal { width: min(500px, 100%); padding: 23px; }
+        .modal h3 { margin: 0 0 16px; }
+        .modal input, .modal select { width: 100%; padding: 10px 12px; border: 1px solid #d8dfe3; border-radius: 7px; background: #fff; }
+        .modal-actions { justify-content: flex-end; margin-top: 18px; }
+        .toast { position: fixed; right: 22px; bottom: 22px; max-width: min(470px, calc(100vw - 44px)); padding: 11px 17px; border-radius: 8px; background: #333; color: #fff; opacity: 0; transform: translateY(14px); transition: .2s; pointer-events: none; z-index: 20; }
+        .toast.show { opacity: 1; transform: translateY(0); }
+        .toast.success { background: #008d3b; }
+        .toast.error { background: #c63838; }
+        @media (max-width: 1000px) {
+            .session-row { grid-template-columns: 24px 32px 1fr; }
+            .session-row .directory, .session-row .updated, .actions { grid-column: 3; }
+            .actions { justify-content: flex-start; }
+        }
+        @media (max-width: 650px) {
+            body { padding: 20px 10px; }
+            .header { display: block; }
+            .header-actions { justify-content: flex-start; margin-top: 14px; }
+            .stats { grid-template-columns: 1fr; }
+            .checkbox { margin-left: 0; }
+            .toolbar label, .toolbar select { width: 100%; margin-left: 0; }
+        }
+    </style>
+</head>
+<body>
+    <main class="container">
+        <header class="header">
+            <div>
+                <h1>MiMo Code 会话管理器</h1>
+                <p>筛选、排序并管理本机 MiMo Code 会话</p>
+            </div>
+            <div class="header-actions">
+                <button class="button button-primary" id="newSessionButton" type="button">新建对话</button>
+                <button class="button button-secondary" id="refreshButton" type="button">刷新状态</button>
+            </div>
+        </header>
+
+        <section class="stats" aria-label="会话统计">
+            <div class="card"><div class="card-label">可见会话</div><div class="card-value" id="visibleCount">-</div></div>
+            <div class="card"><div class="card-label">全部会话</div><div class="card-value" id="totalCount">-</div></div>
+            <div class="card"><div class="card-label">工作区</div><div class="card-value" id="workspaceCount">-</div></div>
+        </section>
+
+        <section class="toolbar" aria-label="列表控制">
+            <label>工作区
+                <select id="workspaceFilter"><option value="">全部工作区</option></select>
+            </label>
+            <label>排序
+                <select id="sortSelect">
+                    <option value="updated-desc">最近更新优先</option>
+                    <option value="updated-asc">最早更新优先</option>
+                    <option value="title-asc">标题 A-Z</option>
+                    <option value="title-desc">标题 Z-A</option>
+                    <option value="workspace-asc">工作区</option>
+                    <option value="custom">自定义顺序</option>
+                </select>
+            </label>
+            <label class="checkbox"><input id="showHiddenCheckbox" type="checkbox">显示已隐藏会话</label>
+        </section>
+
+        <section class="session-table">
+            <div class="table-header">
+                <h2>会话列表</h2>
+                <span class="count" id="sessionCount">加载中...</span>
+            </div>
+            <div class="bulk-actions">
+                <span class="selection-count" id="selectionCount">已选择 0 项</span>
+                <button class="button button-secondary button-small" id="selectVisibleButton" type="button">全选当前结果</button>
+                <button class="button button-secondary button-small" id="clearSelectionButton" type="button">清空选择</button>
+                <button class="button button-danger button-small" id="hideSelectedButton" type="button">批量隐藏</button>
+                <button class="button button-secondary button-small" id="restoreSelectedButton" type="button">批量恢复</button>
+            </div>
+            <div id="sessionList"><div class="message">正在加载会话...</div></div>
+        </section>
+    </main>
+
+    <div class="modal-overlay" id="renameModal" role="dialog" aria-modal="true" aria-labelledby="renameTitle">
+        <div class="modal">
+            <h3 id="renameTitle">重命名会话</h3>
+            <input type="text" id="renameInput" maxlength="200" autocomplete="off">
+            <div class="modal-actions">
+                <button class="button button-secondary" data-close-modal="renameModal" type="button">取消</button>
+                <button class="button button-primary" id="saveRenameButton" type="button">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="newSessionModal" role="dialog" aria-modal="true" aria-labelledby="newSessionTitle">
+        <div class="modal" style="width:min(600px,100%)">
+            <h3 id="newSessionTitle">新建对话</h3>
+            <p style="margin-bottom:12px;color:#667;font-size:13px">输入路径或浏览选择文件夹</p>
+            <input id="newDirectoryInput" list="workspaceSuggestions" autocomplete="off" placeholder="例如: C:\Users\用户\项目">
+            <datalist id="workspaceSuggestions"></datalist>
+            <div id="workspaceTags" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px"></div>
+            <button class="button button-secondary" id="browseServerButton" type="button" style="margin-top:10px">浏览本地文件夹...</button>
+            <div id="folderBrowser" style="display:none;margin-top:10px;max-height:250px;overflow-y:auto;border:1px solid #d8dfe3;border-radius:7px;background:#fafcfc">
+                <div id="folderBrowserPath" style="padding:8px 12px;font-size:12px;color:#637078;border-bottom:1px solid #edf0f2;cursor:pointer"></div>
+                <div id="folderBrowserList" style="padding:4px 0"></div>
+            </div>
+            <div class="modal-actions">
+                <button class="button button-secondary" data-close-modal="newSessionModal" type="button">取消</button>
+                <button class="button button-primary" id="createSessionButton" type="button">在此工作区新建</button>
+            </div>
+        </div>
+    </div>
+
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+</body>
+</html>
