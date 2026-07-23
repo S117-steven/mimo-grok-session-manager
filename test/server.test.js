@@ -47,6 +47,8 @@ async function startFixtureServer(existingFixture) {
     const launches = [];
     const newLaunches = [];
     const pickedDirectory = fixture.secondDirectory;
+    const previousGrokDir = process.env.GROK_SESSIONS_DIR;
+    process.env.GROK_SESSIONS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mimo-grok-empty-'));
     const server = createServer({
         dbPath: fixture.dbPath,
         statePath: fixture.statePath,
@@ -62,7 +64,11 @@ async function startFixtureServer(existingFixture) {
         newLaunches,
         server,
         baseUrl: `http://127.0.0.1:${port}`,
-        close: () => new Promise(resolve => server.close(resolve))
+        close: async () => {
+            await new Promise(resolve => server.close(resolve));
+            if (previousGrokDir === undefined) delete process.env.GROK_SESSIONS_DIR;
+            else process.env.GROK_SESSIONS_DIR = previousGrokDir;
+        }
     };
 }
 
@@ -79,11 +85,11 @@ test('lists sessions from SQLite, excludes checkpoints, and sorts newest first',
     assert.equal(response.status, 200);
     assert.deepEqual(data.sessions.map(session => session.id), [SESSION_B, SESSION_A]);
     assert.deepEqual(data.workspaces.map(workspace => workspace.directory), [
+        fixture.emptyWorkspace,
         fixture.secondDirectory,
-        fixture.directory,
-        fixture.emptyWorkspace
+        fixture.directory
     ]);
-    assert.equal(data.workspaces[2].sessionCount, 0);
+    assert.equal(data.workspaces[0].sessionCount, 0);
     assert.equal(data.preferences.sortBy, 'updated-desc');
     assert.equal(response.headers.get('access-control-allow-origin'), null);
     assert.match(response.headers.get('content-security-policy'), /script-src 'self'/);
@@ -385,7 +391,134 @@ test('frontend is valid JavaScript and contains no inline event handlers', () =>
     assert.match(html, /id="hideSelectedButton"/);
     assert.match(html, /id="workspaceTags"/);
     assert.match(html, /id="folderBrowser"/);
+    assert.match(html, /data-provider="grok"/);
+    assert.match(html, /id="createGrokSessionButton"/);
+    assert.match(app, /createGrokSession/);
+    assert.match(app, /continueGrokSession/);
+    assert.doesNotMatch(app, /if \(!isGrok\) \{\s*actions\.append\(createButton\(isPinned/);
 });
+
+function createGrokFixtureSession(rootDir, {
+    id = '019f90cd-9a0f-71a3-b8fa-c762dbff617e',
+    cwd = 'C:\\Users\\test\\project',
+    title = 'Original Grok Title'
+} = {}) {
+    const encodedCwd = encodeURIComponent(cwd);
+    const sessionDir = path.join(rootDir, encodedCwd, id);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const summary = {
+        info: { id, cwd },
+        session_summary: title,
+        generated_title: title,
+        created_at: '2026-07-23T10:00:00.000Z',
+        updated_at: '2026-07-23T12:00:00.000Z',
+        num_messages: 3,
+        current_model_id: 'grok-4.5'
+    };
+    fs.writeFileSync(path.join(sessionDir, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
+    return { id, cwd, sessionDir, summaryPath: path.join(sessionDir, 'summary.json') };
+}
+
+async function startGrokAwareServer() {
+    const fixture = createFixture();
+    const grokRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mimo-grok-sessions-'));
+    const previousGrokDir = process.env.GROK_SESSIONS_DIR;
+    process.env.GROK_SESSIONS_DIR = grokRoot;
+    const grokSession = createGrokFixtureSession(grokRoot, { cwd: fixture.directory });
+    const grokLaunches = [];
+    const server = createServer({
+        dbPath: fixture.dbPath,
+        statePath: fixture.statePath,
+        launcher: async () => {},
+        newLauncher: async () => {},
+        grokLauncher: async session => { grokLaunches.push(session); },
+        folderPicker: async () => fixture.directory
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    return {
+        ...fixture,
+        grokRoot,
+        grokSession,
+        grokLaunches,
+        server,
+        baseUrl: `http://127.0.0.1:${port}`,
+        close: async () => {
+            await new Promise(resolve => server.close(resolve));
+            if (previousGrokDir === undefined) delete process.env.GROK_SESSIONS_DIR;
+            else process.env.GROK_SESSIONS_DIR = previousGrokDir;
+        }
+    };
+}
+
+test('lists, renames, pins, and hides Grok sessions like MiMo sessions', async t => {
+    const fixture = await startGrokAwareServer();
+    t.after(fixture.close);
+
+    const listed = await jsonRequest(fixture.baseUrl, '/api/sessions');
+    assert.equal(listed.response.status, 200);
+    assert.equal(listed.data.grokSessions.length, 1);
+    assert.equal(listed.data.grokSessions[0].id, fixture.grokSession.id);
+    assert.equal(listed.data.grokSessions[0].title, 'Original Grok Title');
+    assert.equal(listed.data.grokSessions[0].provider, 'grok');
+    assert.ok(listed.data.workspaces.some(workspace =>
+        workspace.directory.toLowerCase() === fixture.directory.toLowerCase() &&
+        workspace.sessionCount >= 2
+    ));
+
+    const renamedTitle = 'Renamed Grok Session';
+    const renamed = await jsonRequest(fixture.baseUrl, '/api/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: fixture.grokSession.id, title: renamedTitle })
+    });
+    assert.equal(renamed.response.status, 200);
+    const summary = JSON.parse(fs.readFileSync(fixture.grokSession.summaryPath, 'utf8'));
+    assert.equal(summary.manager_title, renamedTitle);
+    assert.equal(summary.generated_title, 'Original Grok Title');
+
+    const afterRename = await jsonRequest(fixture.baseUrl, '/api/sessions');
+    assert.equal(afterRename.data.grokSessions[0].title, renamedTitle);
+
+    const preferences = await jsonRequest(fixture.baseUrl, '/api/preferences', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            sortBy: 'custom',
+            pinnedIds: [fixture.grokSession.id, SESSION_A],
+            customOrder: [fixture.grokSession.id, SESSION_A, SESSION_B]
+        })
+    });
+    assert.equal(preferences.response.status, 200);
+    assert.deepEqual(preferences.data.preferences.pinnedIds, [fixture.grokSession.id, SESSION_A]);
+    assert.deepEqual(preferences.data.preferences.customOrder, [fixture.grokSession.id, SESSION_A, SESSION_B]);
+
+    const hidden = await jsonRequest(fixture.baseUrl, '/api/hide', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: fixture.grokSession.id, hidden: true })
+    });
+    assert.equal(hidden.response.status, 200);
+    assert.deepEqual(hidden.data.preferences.hiddenIds, [fixture.grokSession.id]);
+
+    const batch = await jsonRequest(fixture.baseUrl, '/api/hide-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [fixture.grokSession.id, SESSION_B], hidden: true })
+    });
+    assert.equal(batch.response.status, 200);
+    assert.deepEqual(new Set(batch.data.preferences.hiddenIds), new Set([fixture.grokSession.id, SESSION_B]));
+
+    const continued = await jsonRequest(fixture.baseUrl, '/api/continue-grok', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: fixture.grokSession.id })
+    });
+    assert.equal(continued.response.status, 200);
+    assert.equal(fixture.grokLaunches.length, 1);
+    assert.equal(fixture.grokLaunches[0].id, fixture.grokSession.id);
+});
+
 
 
 

@@ -1,10 +1,12 @@
 'use strict';
 
 let sessions = [];
+let grokSessions = [];
 let workspaces = [];
 let preferences = { sortBy: 'updated-desc', pinnedIds: [], hiddenIds: [], customOrder: [] };
 let currentRenameId = null;
 let toastTimer = null;
+let currentProvider = 'all';
 const selectedIds = new Set();
 
 const elements = Object.fromEntries([
@@ -57,21 +59,34 @@ function baseSort(items) {
     const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
     const customPositions = new Map(preferences.customOrder.map((id, index) => [id, index]));
     const compare = {
-        'updated-desc': (a, b) => b.timeUpdated - a.timeUpdated,
-        'updated-asc': (a, b) => a.timeUpdated - b.timeUpdated,
+        'updated-desc': (a, b) => (b.timeUpdated || 0) - (a.timeUpdated || 0),
+        'updated-asc': (a, b) => (a.timeUpdated || 0) - (b.timeUpdated || 0),
         'title-asc': (a, b) => collator.compare(a.title, b.title),
         'title-desc': (a, b) => collator.compare(b.title, a.title),
-        'workspace-asc': (a, b) => collator.compare(a.directory, b.directory) || b.timeUpdated - a.timeUpdated,
+        'workspace-asc': (a, b) => collator.compare(a.directory, b.directory) || (b.timeUpdated || 0) - (a.timeUpdated || 0),
         custom: (a, b) => (customPositions.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
-            (customPositions.get(b.id) ?? Number.MAX_SAFE_INTEGER) || b.timeUpdated - a.timeUpdated
+            (customPositions.get(b.id) ?? Number.MAX_SAFE_INTEGER) || (b.timeUpdated || 0) - (a.timeUpdated || 0)
     }[preferences.sortBy];
     const pinned = idSet(preferences.pinnedIds);
     return [...items].sort((a, b) => Number(pinned.has(b.id)) - Number(pinned.has(a.id)) || compare(a, b));
 }
 
+function getCombinedSessions() {
+    const mimoMarked = sessions.map(s => ({ ...s, provider: 'mimo' }));
+    const grokMarked = grokSessions.map(s => ({
+        ...s,
+        provider: 'grok',
+        timeUpdated: s.timeUpdated || (s.updatedAt ? new Date(s.updatedAt).getTime() : 0),
+        updated: s.updated || s.updatedAt || '-'
+    }));
+    if (currentProvider === 'grok') return grokMarked;
+    if (currentProvider === 'mimo') return mimoMarked;
+    return mimoMarked.concat(grokMarked);
+}
+
 function displayedSessions() {
     const hidden = idSet(preferences.hiddenIds);
-    return baseSort(sessions).filter(session =>
+    return baseSort(getCombinedSessions()).filter(session =>
         (!elements.workspaceFilter.value ||
             session.directory.toLowerCase() === elements.workspaceFilter.value.toLowerCase()) &&
         (elements.showHiddenCheckbox.checked || !hidden.has(session.id))
@@ -108,16 +123,21 @@ function updateSelectionControls() {
     elements.restoreSelectedButton.disabled = selectedIds.size === 0;
 }
 
+function renderProviderStats() {
+    const totalCount = sessions.length + grokSessions.length;
+    elements.totalCount.textContent = String(totalCount);
+    elements.workspaceCount.textContent = String(workspaces.length);
+}
+
 function renderSessions() {
     const visible = displayedSessions();
     const pinned = idSet(preferences.pinnedIds);
     const hidden = idSet(preferences.hiddenIds);
-    const existingIds = idSet(sessions.map(session => session.id));
-    const hiddenCount = [...hidden].filter(id => existingIds.has(id)).length;
+    const knownIds = idSet([...sessions.map(s => s.id), ...grokSessions.map(s => s.id)]);
+    const hiddenCount = [...hidden].filter(id => knownIds.has(id)).length;
     elements.sessionList.replaceChildren();
+    renderProviderStats();
     elements.visibleCount.textContent = String(visible.filter(item => !hidden.has(item.id)).length);
-    elements.totalCount.textContent = String(sessions.length);
-    elements.workspaceCount.textContent = String(workspaces.length);
     elements.sessionCount.textContent = `${visible.length} 项${hiddenCount ? `，已隐藏 ${hiddenCount} 项` : ''}`;
 
     if (!visible.length) {
@@ -130,6 +150,7 @@ function renderSessions() {
     visible.forEach((session, index) => {
         const isPinned = pinned.has(session.id);
         const isHidden = hidden.has(session.id);
+        const isGrok = session.provider === 'grok';
         const row = document.createElement('div');
         row.className = `session-row${isPinned ? ' pinned' : ''}${isHidden ? ' hidden-session' : ''}`;
         const checkbox = document.createElement('input');
@@ -142,9 +163,21 @@ function renderSessions() {
         });
         row.append(checkbox);
         row.append(createTextElement('span', isPinned ? 'pin-mark' : 'muted', isPinned ? '置顶' : String(index + 1)));
-        row.append(createTextElement('span', 'title', session.title, session.title));
+
+        const titleEl = createTextElement('span', 'title', session.title, session.title);
+        if (isGrok) {
+            const badge = createTextElement('span', 'provider-badge provider-grok', 'Grok');
+            const wrapper = document.createElement('span');
+            wrapper.style.cssText = 'display:inline-flex;align-items:center;gap:6px;overflow:hidden';
+            wrapper.append(badge);
+            wrapper.append(titleEl);
+            row.append(wrapper);
+        } else {
+            row.append(titleEl);
+        }
+
         row.append(createTextElement('span', 'directory', session.directory, session.directory));
-        row.append(createTextElement('span', 'updated', session.updated || '-'));
+        row.append(createTextElement('span', 'updated', session.updated || session.updatedAt || '-'));
 
         const actions = document.createElement('div');
         actions.className = 'actions';
@@ -154,7 +187,10 @@ function renderSessions() {
             actions.append(createButton('下移', 'button-secondary', () => moveSession(session.id, 1)));
         }
         actions.append(createButton('重命名', 'button-secondary', () => openRename(session)));
-        actions.append(createButton('继续', 'button-primary', event => continueSession(session.id, event.currentTarget)));
+        actions.append(createButton('继续', 'button-primary', event => {
+            if (isGrok) continueGrokSession(session.id, event.currentTarget);
+            else continueSession(session.id, event.currentTarget);
+        }));
         actions.append(createButton(isHidden ? '恢复' : '隐藏', isHidden ? 'button-secondary' : 'button-danger', () => toggleHidden(session, !isHidden)));
         row.append(actions);
         fragment.append(row);
@@ -169,7 +205,11 @@ async function loadSessions() {
     try {
         const data = await requestJson('/api/sessions');
         sessions = data.sessions;
-        const existingIds = idSet(sessions.map(session => session.id));
+        grokSessions = data.grokSessions || [];
+        const existingIds = idSet([
+            ...sessions.map(session => session.id),
+            ...grokSessions.map(session => session.id)
+        ]);
         [...selectedIds].forEach(id => {
             if (!existingIds.has(id)) selectedIds.delete(id);
         });
@@ -201,7 +241,7 @@ async function togglePin(id) {
 
 async function moveSession(id, direction) {
     const pinned = idSet(preferences.pinnedIds);
-    const current = baseSort(sessions).map(item => item.id);
+    const current = baseSort(getCombinedSessions()).map(item => item.id);
     const group = displayedSessions()
         .map(item => item.id)
         .filter(itemId => pinned.has(itemId) === pinned.has(id));
@@ -217,7 +257,7 @@ async function moveSession(id, direction) {
 }
 
 async function toggleHidden(session, hidden) {
-    if (hidden && !window.confirm(`隐藏会话“${session.title}”？这不会删除真实会话。`)) return;
+    if (hidden && !window.confirm(`隐藏会话"${session.title}"？这不会删除真实会话。`)) return;
     try {
         const data = await postJson('/api/hide', { id: session.id, hidden });
         preferences = data.preferences;
@@ -279,6 +319,15 @@ async function continueSession(id, button) {
     finally { button.disabled = false; }
 }
 
+async function continueGrokSession(id, button) {
+    button.disabled = true;
+    try {
+        await postJson('/api/continue-grok', { id });
+        showToast('已打开 Grok 会话', 'success');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { button.disabled = false; }
+}
+
 let currentBrowsePath = '';
 
 async function browseFolders(dir) {
@@ -296,7 +345,7 @@ async function browseFolders(dir) {
             const parent = data.path.replace(/[\\\/][^\\\/]+[\\\/]?$/, '') || '';
             const upItem = document.createElement('div');
             upItem.style.cssText = 'padding:8px 12px;cursor:pointer;font-size:13px;color:#00a846';
-            upItem.textContent = '📁 .. (上级目录)';
+            upItem.textContent = '.. (上级目录)';
             upItem.addEventListener('click', () => browseFolders(parent));
             listEl.append(upItem);
         }
@@ -304,7 +353,7 @@ async function browseFolders(dir) {
             const fullPath = data.path ? `${data.path}\\${name}` : name;
             const item = document.createElement('div');
             item.style.cssText = 'padding:8px 12px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:6px';
-            item.innerHTML = `<span style="color:#b77900">📁</span> ${name}`;
+            item.textContent = name;
             item.addEventListener('click', () => {
                 if (data.path) {
                     elements.newDirectoryInput.value = fullPath;
@@ -339,13 +388,32 @@ async function createSession() {
     finally { elements.createSessionButton.disabled = false; }
 }
 
-
+async function createGrokSession() {
+    const directory = elements.newDirectoryInput.value.trim();
+    if (!directory) return showToast('请选择或输入本地文件夹', 'error');
+    elements.createGrokSessionButton.disabled = true;
+    try {
+        await postJson('/api/new-grok', { directory });
+        closeModal(elements.newSessionModal);
+        showToast('已在所选工作区打开 Grok 对话', 'success');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { elements.createGrokSessionButton.disabled = false; }
+}
 
 function showToast(message, type) {
     clearTimeout(toastTimer);
     elements.toast.textContent = message;
     elements.toast.className = `toast ${type || ''} show`;
     toastTimer = setTimeout(() => elements.toast.classList.remove('show'), 3000);
+}
+
+function setProvider(provider) {
+    currentProvider = provider;
+    document.querySelectorAll('.provider-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.provider === provider);
+    });
+    selectedIds.clear();
+    renderSessions();
 }
 
 elements.refreshButton.addEventListener('click', loadSessions);
@@ -356,6 +424,8 @@ elements.newSessionButton.addEventListener('click', () => {
     openModal(elements.newSessionModal);
 });
 elements.createSessionButton.addEventListener('click', createSession);
+elements.createGrokSessionButton = document.getElementById('createGrokSessionButton');
+elements.createGrokSessionButton.addEventListener('click', createGrokSession);
 document.getElementById('browseServerButton').addEventListener('click', () => browseFolders(''));
 elements.selectVisibleButton.addEventListener('click', () => {
     displayedSessions().forEach(session => selectedIds.add(session.id));
@@ -375,7 +445,7 @@ elements.sortSelect.addEventListener('change', async event => {
         const changes = { sortBy: event.target.value };
         if (event.target.value === 'custom' && preferences.customOrder.length === 0) {
             const hidden = idSet(preferences.hiddenIds);
-            changes.customOrder = baseSort(sessions).filter(item => !hidden.has(item.id)).map(item => item.id);
+            changes.customOrder = baseSort(getCombinedSessions()).filter(item => !hidden.has(item.id)).map(item => item.id);
         }
         await savePreferences(changes);
     } catch (error) {
@@ -399,6 +469,9 @@ document.querySelectorAll('.modal-overlay').forEach(modal => {
 });
 document.addEventListener('keydown', event => {
     if (event.key === 'Escape') document.querySelectorAll('.modal-overlay.active').forEach(closeModal);
+});
+document.querySelectorAll('.provider-tab').forEach(tab => {
+    tab.addEventListener('click', () => setProvider(tab.dataset.provider));
 });
 
 loadSessions();

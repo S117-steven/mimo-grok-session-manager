@@ -1,20 +1,20 @@
 {
-  "name": "mimo-session-manager",
-  "version": "1.0.0",
-  "description": "Local-only session manager for MiMo Code",
+  "name": "mimo-grok-session-manager",
+  "version": "1.1.0",
+  "description": "Local-only session manager for MiMo Code & Grok Build",
   "main": "server.js",
   "scripts": {
     "test": "node --test",
-    "check": "node --check server.js && node --check app.js",
+    "check": "node --check server.js && node --check app.js && node --check grok-sessions.js",
     "start": "node server.js"
   },
-  "keywords": ["mimo", "session", "manager"],
+  "keywords": ["mimo", "grok", "session", "manager"],
   "author": "S117-steven",
   "license": "MIT",
   "type": "commonjs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/S117-steven/MiMo-Session-Manager.git"
+    "url": "https://github.com/S117-steven/mimo-grok-session-manager.git"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0"

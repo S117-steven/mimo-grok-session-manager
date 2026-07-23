@@ -3,13 +3,26 @@ const http = require('http');
 const path = require('path');
 const { execFile, execFileSync, spawn } = require('child_process');
 const Database = require('better-sqlite3');
+const {
+    listGrokSessions,
+    findGrokSession,
+    renameGrokSession,
+    createGrokLauncher,
+    isGrokInstalled,
+    GROK_SESSION_ID_PATTERN
+} = require('./grok-sessions');
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3456;
 const MAX_BODY_BYTES = 32 * 1024;
 const BODY_TIMEOUT_MS = 5000;
 const MAX_TITLE_LENGTH = 200;
-const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]{1,128}$/;
+const MIMO_SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]{1,128}$/;
+// Accepts MiMo (`ses_...`) and Grok Build (UUIDv7) session IDs.
+const SESSION_ID_PATTERN = new RegExp(
+    `^(?:${MIMO_SESSION_ID_PATTERN.source.slice(1, -1)}|${GROK_SESSION_ID_PATTERN.source.slice(1, -1)})$`,
+    'i'
+);
 const SORT_OPTIONS = new Set(['updated-desc', 'updated-asc', 'title-asc', 'title-desc', 'workspace-asc', 'custom']);
 const DEFAULT_STATE = Object.freeze({ sortBy: 'updated-desc', pinnedIds: [], hiddenIds: [], customOrder: [] });
 
@@ -186,7 +199,7 @@ function findSession(dbPath, id) {
 }
 
 function findMissingSessionIds(dbPath, ids) {
-    return withDatabase(dbPath, { readonly: true }, db => {
+    const missingFromMimo = withDatabase(dbPath, { readonly: true }, db => {
         const existing = new Set();
         for (let offset = 0; offset < ids.length; offset += 500) {
             const chunk = ids.slice(offset, offset + 500);
@@ -195,9 +208,12 @@ function findMissingSessionIds(dbPath, ids) {
         }
         return ids.filter(id => !existing.has(id));
     });
+    if (!missingFromMimo.length) return [];
+    const existingGrokIds = new Set(listGrokSessions().map(session => session.id));
+    return missingFromMimo.filter(id => !existingGrokIds.has(id));
 }
 
-function listWorkspaces(dbPath) {
+function listWorkspaces(dbPath, grokSessions = []) {
     return withDatabase(dbPath, { readonly: true }, db => {
         const rows = db.prepare(`
             SELECT directory, COUNT(*) AS sessionCount, MAX(time_updated) AS timeUpdated
@@ -211,16 +227,37 @@ function listWorkspaces(dbPath) {
             const key = item.directory.toLowerCase();
             const existing = merged.get(key);
             if (existing) existing.sessionCount += item.sessionCount;
-            else merged.set(key, { directory: item.directory, sessionCount: item.sessionCount });
+            else merged.set(key, { directory: item.directory, sessionCount: item.sessionCount, timeUpdated: item.timeUpdated || 0 });
         });
         const hasProjectTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project'").get();
         if (hasProjectTable) {
-            db.prepare("SELECT worktree FROM project WHERE worktree <> '/' ORDER BY time_updated DESC").all().forEach(project => {
+            db.prepare("SELECT worktree, time_updated AS timeUpdated FROM project WHERE worktree <> '/' ORDER BY time_updated DESC").all().forEach(project => {
                 const key = project.worktree.toLowerCase();
-                if (!merged.has(key)) merged.set(key, { directory: project.worktree, sessionCount: 0 });
+                if (!merged.has(key)) merged.set(key, { directory: project.worktree, sessionCount: 0, timeUpdated: project.timeUpdated || 0 });
             });
         }
-        return [...merged.values()];
+        grokSessions.forEach(session => {
+            if (!session.directory) return;
+            const key = session.directory.toLowerCase();
+            const existing = merged.get(key);
+            if (existing) {
+                existing.sessionCount += 1;
+                existing.timeUpdated = Math.max(existing.timeUpdated || 0, session.timeUpdated || 0);
+            } else {
+                merged.set(key, {
+                    directory: session.directory,
+                    sessionCount: 1,
+                    timeUpdated: session.timeUpdated || 0
+                });
+            }
+        });
+        return [...merged.values()]
+            .map(({ directory, sessionCount }) => ({ directory, sessionCount }))
+            .sort((a, b) => {
+                const left = merged.get(a.directory.toLowerCase())?.timeUpdated || 0;
+                const right = merged.get(b.directory.toLowerCase())?.timeUpdated || 0;
+                return right - left;
+            });
     });
 }
 
@@ -337,6 +374,7 @@ function createServer(options = {}) {
     const launcher = options.launcher || createTerminalLauncher(resolveMimoCommand());
     const newLauncher = options.newLauncher || launcher;
     const folderPicker = options.folderPicker || createFolderPicker();
+    const grokLauncher = options.grokLauncher || (isGrokInstalled() ? createGrokLauncher() : null);
     const logger = options.logger || console;
     const indexPath = options.indexPath || path.join(__dirname, 'index.html');
     const appPath = options.appPath || path.join(__dirname, 'app.js');
@@ -360,7 +398,13 @@ function createServer(options = {}) {
             }
             if (requestUrl.pathname === '/api/sessions') {
                 requireMethod(req, res, 'GET');
-                sendJson(res, 200, { sessions: listSessions(dbPath), workspaces: listWorkspaces(dbPath), preferences: loadState(statePath, logger) });
+                const grokSessions = listGrokSessions();
+                sendJson(res, 200, {
+                    sessions: listSessions(dbPath),
+                    grokSessions,
+                    workspaces: listWorkspaces(dbPath, grokSessions),
+                    preferences: loadState(statePath, logger)
+                });
                 return;
             }
             if (requestUrl.pathname === '/api/preferences') {
@@ -394,7 +438,15 @@ function createServer(options = {}) {
             if (requestUrl.pathname === '/api/rename') {
                 requireMethod(req, res, 'POST');
                 const body = await readJsonBody(req);
-                if (renameSession(dbPath, validateId(body.id), validateTitle(body.title)) !== 1) throw new HttpError(404, 'session_not_found', 'Session was not found');
+                const id = validateId(body.id);
+                const title = validateTitle(body.title);
+                let renamed = false;
+                if (MIMO_SESSION_ID_PATTERN.test(id)) {
+                    renamed = renameSession(dbPath, id, title) === 1;
+                } else if (GROK_SESSION_ID_PATTERN.test(id)) {
+                    renamed = renameGrokSession(id, title);
+                }
+                if (!renamed) throw new HttpError(404, 'session_not_found', 'Session was not found');
                 sendJson(res, 200, { success: true });
                 return;
             }
@@ -412,6 +464,25 @@ function createServer(options = {}) {
                 requireMethod(req, res, 'POST');
                 const body = await readJsonBody(req);
                 await newLauncher({ directory: validateLocalDirectory(body.directory) });
+                sendJson(res, 200, { success: true });
+                return;
+            }
+            if (requestUrl.pathname === '/api/continue-grok') {
+                requireMethod(req, res, 'POST');
+                if (!grokLauncher) throw new HttpError(501, 'grok_not_installed', 'Grok Build is not installed');
+                const body = await readJsonBody(req);
+                const session = findGrokSession(validateId(body.id));
+                if (!session) throw new HttpError(404, 'session_not_found', 'Grok session was not found');
+                validateLocalDirectory(session.directory);
+                await grokLauncher(session);
+                sendJson(res, 200, { success: true });
+                return;
+            }
+            if (requestUrl.pathname === '/api/new-grok') {
+                requireMethod(req, res, 'POST');
+                if (!grokLauncher) throw new HttpError(501, 'grok_not_installed', 'Grok Build is not installed');
+                const body = await readJsonBody(req);
+                await grokLauncher({ directory: validateLocalDirectory(body.directory) });
                 sendJson(res, 200, { success: true });
                 return;
             }
